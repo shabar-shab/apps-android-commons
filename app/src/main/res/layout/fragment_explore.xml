@@ -11,15 +11,15 @@
         android:background="@color/card_light_grey">
 
         <com.google.android.material.tabs.TabLayout
-            android:id="@+id/tab_layout"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_below="@id/toolbar"
-            android:background="?attr/tabBackground"
-            app:tabIndicatorColor="?attr/tabIndicatorColor"
-            app:tabMode="fixed"
-            app:tabSelectedTextColor="?attr/tabSelectedTextColor"
-            app:tabTextColor="?attr/tabTextColor" />
+          android:id="@+id/tab_layout"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_below="@id/toolbar"
+          android:background="#FFFFFF"
+          app:tabIndicatorColor="?attr/tabIndicatorColor"
+          app:tabMode="fixed"
+          app:tabSelectedTextColor="?attr/tabSelectedTextColor"
+          app:tabTextColor="?attr/tabTextColor" />
     </com.google.android.material.appbar.AppBarLayout>
 
     <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
