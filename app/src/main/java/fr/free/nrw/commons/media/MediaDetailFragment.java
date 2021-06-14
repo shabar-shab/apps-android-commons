@@ -1,5 +1,7 @@
 package fr.free.nrw.commons.media;
 
+import static android.app.Activity.RESULT_CANCELED;
+import static android.app.Activity.RESULT_OK;
 import static android.view.View.GONE;
 import static android.view.View.VISIBLE;
 import static fr.free.nrw.commons.category.CategoryClientKt.CATEGORY_NEEDING_CATEGORIES;
@@ -24,6 +26,7 @@ import android.view.ViewTreeObserver.OnGlobalLayoutListener;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -46,21 +49,27 @@ import com.facebook.imagepipeline.image.ImageInfo;
 import com.facebook.imagepipeline.request.ImageRequest;
 import com.jakewharton.rxbinding2.view.RxView;
 import com.jakewharton.rxbinding2.widget.RxSearchView;
+import com.mapbox.mapboxsdk.camera.CameraPosition;
+import com.mapbox.mapboxsdk.geometry.LatLng;
+import fr.free.nrw.commons.LocationPicker.LocationPicker;
 import fr.free.nrw.commons.Media;
 import fr.free.nrw.commons.MediaDataExtractor;
 import fr.free.nrw.commons.R;
 import fr.free.nrw.commons.Utils;
 import fr.free.nrw.commons.auth.AccountUtil;
+import fr.free.nrw.commons.auth.SessionManager;
 import fr.free.nrw.commons.category.CategoryClient;
 import fr.free.nrw.commons.category.CategoryDetailsActivity;
 import fr.free.nrw.commons.category.CategoryEditHelper;
 import fr.free.nrw.commons.category.CategoryEditSearchRecyclerViewAdapter;
 import fr.free.nrw.commons.category.CategoryEditSearchRecyclerViewAdapter.Callback;
 import fr.free.nrw.commons.contributions.ContributionsFragment;
+import fr.free.nrw.commons.coordinates.CoordinateEditHelper;
 import fr.free.nrw.commons.delete.DeleteHelper;
 import fr.free.nrw.commons.delete.ReasonBuilder;
-import fr.free.nrw.commons.explore.depictions.WikidataItemDetailsActivity;
 import fr.free.nrw.commons.di.CommonsDaggerSupportFragment;
+import fr.free.nrw.commons.explore.depictions.WikidataItemDetailsActivity;
+import fr.free.nrw.commons.kvstore.JsonKvStore;
 import fr.free.nrw.commons.nearby.Label;
 import fr.free.nrw.commons.ui.widget.HtmlTextView;
 import fr.free.nrw.commons.utils.ViewUtilWrapper;
@@ -71,9 +80,11 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.TimeUnit;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import javax.inject.Inject;
+import javax.inject.Named;
 import org.apache.commons.lang3.StringUtils;
 import org.wikipedia.util.DateUtil;
 import timber.log.Timber;
@@ -81,12 +92,14 @@ import timber.log.Timber;
 public class MediaDetailFragment extends CommonsDaggerSupportFragment implements Callback,
     CategoryEditHelper.Callback {
 
+    private static final int REQUEST_CODE = 1001 ;
     private boolean editable;
     private boolean isCategoryImage;
     private MediaDetailPagerFragment.MediaDetailProvider detailProvider;
     private int index;
     private boolean isDeleted = false;
     private boolean isWikipediaButtonDisplayed;
+    private Callback callback;
 
 
     public static MediaDetailFragment forMedia(int index, boolean editable, boolean isCategoryImage, boolean isWikipediaButtonDisplayed) {
@@ -106,6 +119,9 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
     }
 
     @Inject
+    SessionManager sessionManager;
+
+    @Inject
     MediaDataExtractor mediaDataExtractor;
     @Inject
     ReasonBuilder reasonBuilder;
@@ -114,16 +130,21 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
     @Inject
     CategoryEditHelper categoryEditHelper;
     @Inject
+    CoordinateEditHelper coordinateEditHelper;
+    @Inject
     ViewUtilWrapper viewUtil;
     @Inject
     CategoryClient categoryClient;
+    @Inject
+    @Named("default_preferences")
+    JsonKvStore applicationKvStore;
 
     private int initialListTop = 0;
 
+    @BindView(R.id.mediaDetailFrameLayout)
+    FrameLayout frameLayout;
     @BindView(R.id.mediaDetailImageView)
     SimpleDraweeView image;
-    @BindView(R.id.mediaDetailImageViewLandscape)
-    SimpleDraweeView imageLandscape;
     @BindView(R.id.mediaDetailImageViewSpacer)
     LinearLayout imageSpacer;
     @BindView(R.id.mediaDetailTitle)
@@ -182,6 +203,8 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
     TextView existingCategories;
     @BindView(R.id.no_results_found)
     TextView noResultsFound;
+    @BindView(R.id.progressBarDeletion)
+    ProgressBar progressBarDeletion;
 
     private ArrayList<String> categoryNames = new ArrayList<>();
     private String categorySearchQuery;
@@ -202,6 +225,20 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
     private Media media;
     private ArrayList<String> reasonList;
 
+    /**
+     * Height stores the height of the frame layout as soon as it is initialised and updates itself on
+     * configuration changes.
+     * Used to adjust aspect ratio of image when length of the image is too large.
+     */
+    private int frameLayoutHeight;
+
+    /**
+     * Minimum height of the metadata, in pixels.
+     * Images with a very narrow aspect ratio will be reduced so that the metadata information panel always has at least this height.
+     */
+    private int minimumHeightOfMetadata = 200;
+
+    final static String NOMINATING_FOR_DELETION_MEDIA = "Nominating for deletion %s";
 
     @Override
     public void onSaveInstanceState(Bundle outState) {
@@ -258,7 +295,34 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
             authorLayout.setVisibility(GONE);
         }
 
+        if (!sessionManager.isUserLoggedIn()) {
+            categoryEditButton.setVisibility(GONE);
+        }
+
+        if(applicationKvStore.getBoolean("login_skipped")){
+            delete.setVisibility(GONE);
+        }
+        /**
+         * Gets the height of the frame layout as soon as the view is ready and updates aspect ratio
+         * of the picture.
+         */
+        view.post(new Runnable() {
+            @Override
+            public void run() {
+                frameLayoutHeight = frameLayout.getMeasuredHeight();
+                updateAspectRatio(scrollView.getWidth());
+            }
+        });
+
         return view;
+    }
+
+    @Override
+    public void onAttach(final Context context) {
+        super.onAttach(context);
+        if (getParentFragment() != null) {
+            callback = (Callback) getParentFragment();
+        }
     }
 
     @OnClick(R.id.mediaDetailImageViewSpacer)
@@ -288,8 +352,19 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
                 Label.valuesAsList()), categoryRecyclerView, categoryClient, this);
         categoryRecyclerView.setLayoutManager(new LinearLayoutManager(getActivity()));
         categoryRecyclerView.setAdapter(categoryEditSearchRecyclerViewAdapter);
+        // detail provider is null when fragment is shown in review activity
+        if (detailProvider != null) {
+            media = detailProvider.getMediaAtPosition(index);
+        } else {
+            media = getArguments().getParcelable("media");
+        }
 
         media = detailProvider.getMediaAtPosition(index);
+
+        if(media != null && applicationKvStore.getBoolean(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()), false)) {
+            enableProgressBar();
+        }
+
         scrollView.getViewTreeObserver().addOnGlobalLayoutListener(
             new OnGlobalLayoutListener() {
                 @Override
@@ -298,11 +373,10 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
                         return;
                     }
                     scrollView.getViewTreeObserver().removeOnGlobalLayoutListener(this);
-                    if (getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE) {
-                        imageLandscape.setVisibility(VISIBLE);
-                    }
                     oldWidthOfImageView = scrollView.getWidth();
-                    displayMediaDetails();
+                    if(media != null) {
+                        displayMediaDetails();
+                    }
                 }
             }
         );
@@ -315,6 +389,16 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
             new OnGlobalLayoutListener() {
                 @Override
                 public void onGlobalLayout() {
+                    /**
+                     * We update the height of the frame layout as the configuration changes.
+                     */
+                    frameLayout.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            frameLayoutHeight = frameLayout.getMeasuredHeight();
+                            updateAspectRatio(scrollView.getWidth());
+                        }
+                    });
                     if (scrollView.getWidth() != oldWidthOfImageView) {
                         if (newWidthOfImageView == 0) {
                             newWidthOfImageView = scrollView.getWidth();
@@ -325,13 +409,7 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
                 }
             }
         );
-        // check orientation
-        if (getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE) {
-            imageLandscape.setVisibility(VISIBLE);
-        } else if (newConfig.orientation == Configuration.ORIENTATION_PORTRAIT) {
-            imageLandscape.setVisibility(GONE);
-        }
-        // ensuring correct aspect ratio for landscape mode
+        // Ensuring correct aspect ratio for landscape mode
         if (heightVerifyingBoolean) {
             updateAspectRatio(newWidthOfImageView);
             heightVerifyingBoolean = false;
@@ -381,6 +459,10 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
 
     private void onDeletionPageExists(Boolean deletionPageExists) {
         if (deletionPageExists){
+            if(applicationKvStore.getBoolean(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()), false)) {
+                applicationKvStore.remove(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()));
+                progressBarDeletion.setVisibility(GONE);
+            }
             delete.setVisibility(GONE);
             nominatedForDeletion.setVisibility(VISIBLE);
         } else if (!isCategoryImage) {
@@ -397,6 +479,12 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
      * The imageSpacer is Basically a transparent overlay for the SimpleDraweeView
      * which holds the image to be displayed( moreover this image is out of
      * the scroll view )
+     *
+     *
+     * If the image is sufficiently large i.e. the image height extends the view height, we reduce
+     * the height and change the width to maintain the aspect ratio, otherwise image takes up the
+     * total possible width and height is adjusted accordingly.
+     *
      * @param scrollWidth the current width of the scrollView
      */
     private void updateAspectRatio(int scrollWidth) {
@@ -404,11 +492,19 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
             int finalHeight = (scrollWidth*imageInfoCache.getHeight()) / imageInfoCache.getWidth();
             ViewGroup.LayoutParams params = image.getLayoutParams();
             ViewGroup.LayoutParams spacerParams = imageSpacer.getLayoutParams();
+            params.width = scrollWidth;
+            if(finalHeight > frameLayoutHeight - minimumHeightOfMetadata) {
+
+                // Adjust the height and width of image.
+                int temp = frameLayoutHeight - minimumHeightOfMetadata;
+                params.width = (scrollWidth*temp) / finalHeight;
+                finalHeight = temp;
+
+            }
             params.height = finalHeight;
             spacerParams.height = finalHeight;
             image.setLayoutParams(params);
             imageSpacer.setLayoutParams(spacerParams);
-            imageLandscape.setLayoutParams(params);
         }
     }
 
@@ -435,23 +531,13 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
         image.getHierarchy().setPlaceholderImage(R.drawable.image_placeholder);
         image.getHierarchy().setFailureImage(R.drawable.image_placeholder);
 
-        imageLandscape.getHierarchy().setPlaceholderImage(R.drawable.image_placeholder);
-        imageLandscape.getHierarchy().setFailureImage(R.drawable.image_placeholder);
-
         DraweeController controller = Fresco.newDraweeControllerBuilder()
                 .setLowResImageRequest(ImageRequest.fromUri(media.getThumbUrl()))
                 .setImageRequest(ImageRequest.fromUri(media.getImageUrl()))
                 .setControllerListener(aspectRatioListener)
                 .setOldController(image.getController())
                 .build();
-        DraweeController controllerLandscape = Fresco.newDraweeControllerBuilder()
-            .setLowResImageRequest(ImageRequest.fromUri(media.getThumbUrl()))
-            .setImageRequest(ImageRequest.fromUri(media.getImageUrl()))
-            .setControllerListener(aspectRatioListener)
-            .setOldController(imageLandscape.getController())
-            .build();
         image.setController(controller);
-        imageLandscape.setController(controllerLandscape);
     }
 
     /**
@@ -598,13 +684,25 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
      */
     private void buildDepictionList(List<IdAndCaptions> idAndCaptions) {
         depictionContainer.removeAllViews();
+        String locale = Locale.getDefault().getLanguage();
         for (IdAndCaptions idAndCaption : idAndCaptions) {
                 depictionContainer.addView(buildDepictLabel(
-                    idAndCaption.getCaptions().values().iterator().next(),
+                    getDepictionCaption(idAndCaption, locale),
                     idAndCaption.getId(),
                     depictionContainer
                 ));
         }
+    }
+
+    private String getDepictionCaption(IdAndCaptions idAndCaption, String locale) {
+        //Check if the Depiction Caption is available in user's locale if not then check for english, else show any available.
+        if(idAndCaption.getCaptions().get(locale) != null) {
+            return idAndCaption.getCaptions().get(locale);
+        }
+        if(idAndCaption.getCaptions().get("en") != null) {
+            return idAndCaption.getCaptions().get("en");
+        }
+        return idAndCaption.getCaptions().values().iterator().next();
     }
 
     @OnClick(R.id.mediaDetailLicense)
@@ -645,11 +743,96 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
         displayHideCategorySearch();
     }
 
+    /**
+     * Hides the categoryEditContainer.
+     * returns true after closing the categoryEditContainer if open, implying that event was handled.
+     * else returns false
+     * @return
+     */
+    public boolean hideCategoryEditContainerIfOpen(){
+        if (dummyCategoryEditContainer.getVisibility() == VISIBLE) {
+            // editCategory is open, close it and return true as the event was handled.
+            dummyCategoryEditContainer.setVisibility(GONE);
+            return true;
+        }
+        // Event was not handled.
+        return false;
+    }
+
     public void displayHideCategorySearch() {
         if (dummyCategoryEditContainer.getVisibility() != VISIBLE) {
             dummyCategoryEditContainer.setVisibility(VISIBLE);
         } else {
             dummyCategoryEditContainer.setVisibility(GONE);
+        }
+    }
+
+    @OnClick(R.id.coordinate_edit)
+    public void onUpdateCoordinatesClicked(){
+        goToLocationPickerActivity();
+    }
+
+    /**
+     * Start location picker activity with a request code and get the coordinates from the activity.
+     */
+    private void goToLocationPickerActivity() {
+        /*
+        If location is not provided in media this coordinates will act as a placeholder in
+        location picker activity
+         */
+        double defaultLatitude = 37.773972;
+        double defaultLongitude = -122.431297;
+
+        if (media.getCoordinates() != null) {
+            defaultLatitude = media.getCoordinates().getLatitude();
+            defaultLongitude = media.getCoordinates().getLongitude();
+        }
+        startActivityForResult(new LocationPicker.IntentBuilder()
+            .defaultLocation(new CameraPosition.Builder()
+                .target(new LatLng(defaultLatitude, defaultLongitude))
+                .zoom(16).build())
+            .build(getActivity()), REQUEST_CODE);
+    }
+
+    /**
+     * Get the coordinates and update the existing coordinates.
+     * @param requestCode
+     * @param resultCode
+     * @param data
+     */
+    @Override
+    public void onActivityResult(final int requestCode, final int resultCode,
+        @Nullable final Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode == REQUEST_CODE && resultCode == RESULT_OK) {
+
+            assert data != null;
+            final CameraPosition cameraPosition = LocationPicker.getCameraPosition(data);
+
+            if (cameraPosition != null) {
+
+                final String latitude = String.valueOf(cameraPosition.target.getLatitude());
+                final String longitude = String.valueOf(cameraPosition.target.getLongitude());
+                final String accuracy = String.valueOf(cameraPosition.target.getAltitude());
+                String currentLatitude = null;
+                String currentLongitude = null;
+
+                if (media.getCoordinates() != null) {
+                    currentLatitude = String.valueOf(media.getCoordinates().getLatitude());
+                    currentLongitude = String.valueOf(media.getCoordinates().getLongitude());
+                }
+
+                if (!latitude.equals(currentLatitude) || !longitude.equals(currentLongitude)) {
+                    updateCoordinates(latitude, longitude, accuracy);
+                } else if (media.getCoordinates() == null) {
+                    updateCoordinates(latitude, longitude, accuracy);
+                }
+            }
+        } else if (resultCode == RESULT_CANCELED) {
+            viewUtil.showShortToast(getContext(),
+                Objects.requireNonNull(getContext())
+                    .getString(R.string.coordinates_picking_unsuccessful));
         }
     }
 
@@ -673,6 +856,24 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
                 onOutsideOfCategoryEditClicked();
                 media.setAddedCategories(selectedCategories);
                 updateCategoryList();
+            }));
+    }
+
+    /**
+     * Fetched coordinates are replaced with existing coordinates by a POST API call.
+     * @param Latitude to be added
+     * @param Longitude to be added
+     * @param Accuracy to be added
+     */
+    public void updateCoordinates(final String Latitude, final String Longitude,
+        final String Accuracy) {
+        compositeDisposable.add(coordinateEditHelper.makeCoordinatesEdit(getContext(), media,
+            Latitude, Longitude, Accuracy)
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe(s -> {
+                Timber.d("Coordinates are added.");
+                coordinates.setText(prettyCoordinates(media));
             }));
     }
 
@@ -722,7 +923,7 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
                 input.addTextChangedListener(new TextWatcher() {
                     private void handleText() {
                         final Button okButton = d.getButton(AlertDialog.BUTTON_POSITIVE);
-                        if (input.getText().length() == 0) {
+                        if (input.getText().length() == 0 || isDeleted) {
                             okButton.setEnabled(false);
                         } else {
                             okButton.setEnabled(true);
@@ -749,35 +950,37 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
 
     @SuppressLint("CheckResult")
     private void onDeleteClicked(Spinner spinner) {
+        applicationKvStore.putBoolean(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()), true);
+        enableProgressBar();
         String reason = spinner.getSelectedItem().toString();
         Single<Boolean> resultSingle = reasonBuilder.getReason(media, reason)
                 .flatMap(reasonString -> deleteHelper.makeDeletion(getContext(), media, reason));
-        compositeDisposable.add(resultSingle
-                .subscribeOn(Schedulers.io())
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe(s -> {
-                    if (getActivity() != null) {
-                        isDeleted = true;
-                        enableDeleteButton(false);
-                    }
-                }));
-
+        resultSingle
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe(s -> {
+                if(applicationKvStore.getBoolean(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()), false)) {
+                    applicationKvStore.remove(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()));
+                    callback.nominatingForDeletion(index);
+                }
+            });
     }
 
     @SuppressLint("CheckResult")
     private void onDeleteClickeddialogtext(String reason) {
+        applicationKvStore.putBoolean(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()), true);
+        enableProgressBar();
         Single<Boolean> resultSingletext = reasonBuilder.getReason(media, reason)
                 .flatMap(reasonString -> deleteHelper.makeDeletion(getContext(), media, reason));
-        compositeDisposable.add(resultSingletext
-                .subscribeOn(Schedulers.io())
-                .observeOn(AndroidSchedulers.mainThread())
-                .subscribe(s -> {
-                    if (getActivity() != null) {
-                        isDeleted = true;
-                        enableDeleteButton(false);
-                    }
-                }));
-
+        resultSingletext
+            .subscribeOn(Schedulers.io())
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe(s -> {
+                if(applicationKvStore.getBoolean(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()), false)) {
+                    applicationKvStore.remove(String.format(NOMINATING_FOR_DELETION_MEDIA, media.getImageUrl()));
+                    callback.nominatingForDeletion(index);
+                }
+            });
     }
 
     @OnClick(R.id.seeMore)
@@ -787,13 +990,13 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
         }
     }
 
-    private void enableDeleteButton(boolean visibility) {
-        delete.setEnabled(visibility);
-        if (visibility) {
-            delete.setTextColor(getResources().getColor(R.color.primaryTextColor));
-        } else {
-            delete.setTextColor(getResources().getColor(R.color.deleteButtonLight));
-        }
+    /**
+     * Enable Progress Bar and Update delete button text.
+     */
+    private void enableProgressBar() {
+        progressBarDeletion.setVisibility(VISIBLE);
+        delete.setText("Nominating for Deletion");
+        isDeleted = true;
     }
 
     private void rebuildCatList(List<String> categories) {
@@ -922,5 +1125,9 @@ public class MediaDetailFragment extends CommonsDaggerSupportFragment implements
             rebuildCatList(categories);
             return true;
         }
+    }
+
+    public interface Callback {
+        void nominatingForDeletion(int index);
     }
 }

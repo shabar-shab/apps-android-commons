@@ -2,6 +2,7 @@ SELECT
      (SAMPLE(?location) as ?location)
      ?item
      (SAMPLE(COALESCE(?itemLabelPreferredLanguage, ?itemLabelAnyLanguage)) as ?label)
+     (SAMPLE(COALESCE(?itemDescriptionPreferredLanguage, ?itemDescriptionAnyLanguage, "?")) as ?description)
      (SAMPLE(?classId) as ?class)
      (SAMPLE(COALESCE(?classLabelPreferredLanguage, ?classLabelAnyLanguage, "?")) as ?classLabel)
      (SAMPLE(COALESCE(?icon0, ?icon1)) as ?icon)
@@ -10,6 +11,7 @@ SELECT
      (SAMPLE(?commonsCategory) as ?commonsCategory)
      (SAMPLE(?pic) as ?pic)
      (SAMPLE(?destroyed) as ?destroyed)
+     (SAMPLE(?endTime) as ?endTime)
    WHERE {
      # Around given location...
      SERVICE wikibase:around {
@@ -22,6 +24,10 @@ SELECT
      OPTIONAL {?item rdfs:label ?itemLabelPreferredLanguage. FILTER (lang(?itemLabelPreferredLanguage) = "${LANG}")}
      OPTIONAL {?item rdfs:label ?itemLabelAnyLanguage}
 
+     # Get the description in the preferred language of the user, or any other language if no description is available in that language.
+     OPTIONAL {?item schema:description ?itemDescriptionPreferredLanguage. FILTER (lang(?itemDescriptionPreferredLanguage) = "${LANG}")}
+     OPTIONAL {?item schema:description ?itemDescriptionAnyLanguage }
+
      # Get Commons category (P373)
      OPTIONAL { ?item wdt:P373 ?commonsCategory. }
 
@@ -30,6 +36,9 @@ SELECT
 
      # Get (P576)
      OPTIONAL { ?item wdt:P576 ?destroyed. }
+
+     # Get (P582)
+     OPTIONAL { ?item wdt:P582 ?endTime. }
 
      # Get the class label in the preferred language of the user, or any other language if no label is available in that language.
      OPTIONAL {
